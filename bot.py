@@ -11,10 +11,15 @@ from typing import Dict, Optional
 from collections import deque
 import re
 import unicodedata
+import json
+from datetime import datetime
 
 # Load environment variables
 load_dotenv()
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+ENROLLMENT_FILE = 'enrollments.json'
+COURSES_FILE = 'courses.json'
+
 
 # Language codes and names mapping
 SUPPORTED_LANGUAGES = {
@@ -40,6 +45,128 @@ class UserSettings:
         self.attempts: int = 0
         self.conversation_history = deque(maxlen=10)
         self.show_normalized: bool = False
+        self.current_session_id: int = 0
+
+class CourseManager:
+    def __init__(self):
+        self.enrollments = self.load_enrollments()
+        self.courses = self.load_courses()
+    
+    def load_enrollments(self) -> dict:
+        """Load enrollments from JSON file"""
+        if os.path.exists(ENROLLMENT_FILE):
+            try:
+                with open(ENROLLMENT_FILE, 'r') as f:
+                    return json.load(f)
+            except json.JSONDecodeError:
+                return {}
+        return {}
+    
+    def save_enrollments(self):
+        """Save enrollments to JSON file"""
+        with open(ENROLLMENT_FILE, 'w') as f:
+            json.dump(self.enrollments, f, indent=2)
+    
+    def load_courses(self) -> dict:
+        """Load course data from JSON file"""
+        if os.path.exists(COURSES_FILE):
+            with open(COURSES_FILE, 'r') as f:
+                return json.load(f)
+        else:
+            # Default course structure
+            default_courses = {
+                "en": {
+                    "name": "English Course",
+                    "language": "en",
+                    "sessions": [
+                        {
+                            "id": 1,
+                            "name": "Basics 1",
+                            "words": ["hello", "goodbye", "thank you"],
+                            "completed": False
+                        },
+                        {
+                            "id": 2,
+                            "name": "Basics 2",
+                            "words": ["please", "excuse me", "sorry"],
+                            "completed": False
+                        }
+                    ]
+                },
+                # Add more language courses here
+            }
+            # Save default courses to file
+            with open(COURSES_FILE, 'w') as f:
+                json.dump(default_courses, f, indent=2)
+            return default_courses
+        
+    def get_current_session(self, user_id: str) -> Optional[dict]:
+        """Get user's current session"""
+        enrollment = self.get_user_enrollment(user_id)
+        if not enrollment:
+            return None
+        
+        language_code = enrollment["language_code"]
+        current_session_id = enrollment["current_session"]
+        
+        if language_code not in self.courses:
+            return None
+            
+        course = self.courses[language_code]
+        if current_session_id >= len(course["sessions"]):
+            return None
+            
+        return course["sessions"][current_session_id]
+    
+    
+    def enroll_user(self, user_id: str, language_code: str) -> dict:
+        """Enroll a user in a course"""
+        if language_code not in self.courses:
+            raise ValueError(f"No course available for language code: {language_code}")
+        
+        enrollment = {
+            "user_id": user_id,
+            "language_code": language_code,
+            "enrolled_at": datetime.now().isoformat(),
+            "current_session": 0,
+            "completed_sessions": [],
+            "progress": {
+                "total_practice_sessions": 0,
+                "total_words_practiced": 0,
+                "average_score": 0.0,
+                "last_practice": None
+            }
+        }
+        
+        self.enrollments[user_id] = enrollment
+        self.save_enrollments()
+        return enrollment
+    
+    def get_user_enrollment(self, user_id: str) -> Optional[dict]:
+        """Get user's enrollment data"""
+        return self.enrollments.get(user_id)
+    
+    def update_progress(self, user_id: str, session_id: int, score: float):
+        """Update user's progress"""
+        if user_id in self.enrollments:
+            enrollment = self.enrollments[user_id]
+            progress = enrollment["progress"]
+            
+            # Update statistics
+            progress["total_practice_sessions"] += 1
+            progress["total_words_practiced"] += 1
+            progress["last_practice"] = datetime.now().isoformat()
+            
+            # Update average score
+            old_avg = progress["average_score"]
+            old_total = progress["total_practice_sessions"] - 1
+            progress["average_score"] = (old_avg * old_total + score) / progress["total_practice_sessions"]
+            
+            # Update completed sessions if score is good enough
+            if score >= 80 and session_id not in enrollment["completed_sessions"]:
+                enrollment["completed_sessions"].append(session_id)
+            
+            self.save_enrollments()
 
 class CustomBot(commands.Bot):
     def __init__(self):
@@ -48,6 +175,7 @@ class CustomBot(commands.Bot):
         
         # Initialize OpenAI
         self.client = OpenAI(api_key=OPENAI_API_KEY)
+        self.course_manager = CourseManager()
         
         # User settings storage
         self.user_settings: Dict[int, UserSettings] = {}
@@ -56,6 +184,72 @@ class CustomBot(commands.Bot):
         if user_id not in self.user_settings:
             self.user_settings[user_id] = UserSettings()
         return self.user_settings[user_id]
+    
+    def get_current_session(self, user_id: str) -> Optional[dict]:
+        """Get the current session for a user"""
+        return self.course_manager.get_current_session(user_id)
+
+    async def get_course_progress(self, user_id: str) -> discord.Embed:
+        """Generate a progress report embed"""
+        enrollment = self.course_manager.get_user_enrollment(user_id)
+        if not enrollment:
+            return discord.Embed(
+                title="Not Enrolled",
+                description="You're not enrolled in any course. Use !setlang to get started!",
+                color=discord.Color.red()
+            )
+        
+        progress = enrollment["progress"]
+        language = SUPPORTED_LANGUAGES[enrollment["language_code"]]
+        
+        embed = discord.Embed(
+            title=f"{language} Course Progress",
+            color=discord.Color.blue()
+        )
+        
+        embed.add_field(
+            name="Sessions Completed",
+            value=f"{len(enrollment['completed_sessions'])}/{len(self.course_manager.courses[enrollment['language_code']]['sessions'])}",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="Total Practice Sessions",
+            value=str(progress["total_practice_sessions"]),
+            inline=True
+        )
+        
+        embed.add_field(
+            name="Average Score",
+            value=f"{progress['average_score']:.1f}%",
+            inline=True
+        )
+        
+        if progress["last_practice"]:
+            last_practice = datetime.fromisoformat(progress["last_practice"])
+            embed.add_field(
+                name="Last Practice",
+                value=last_practice.strftime("%Y-%m-%d %H:%M"),
+                inline=True
+            )
+        
+        return embed
+    
+    async def generate_tts(self, text: str) -> str:
+        """Generate TTS audio using OpenAI's API"""
+        try:
+            response = self.client.audio.speech.create(
+                model="tts-1",
+                voice="alloy",
+                input=text
+            )
+            
+            filename = f"audio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp3"
+            response.stream_to_file(filename)
+            return filename
+        except Exception as e:
+            print(f"Error generating TTS: {e}")
+            return None
 
 # Initialize bot
 bot = CustomBot()
@@ -75,7 +269,7 @@ async def on_message(message):
         try:
             async with message.channel.typing():
                 response = bot.client.chat.completions.create(
-                    model="gpt-3.5-turbo",
+                    model="gpt-4o-mini",
                     messages=[
                         {"role": "user", "content": message.content}
                     ],
@@ -155,17 +349,138 @@ async def languages(ctx):
     await ctx.send(embed=embed)
 
 @bot.command()
+async def practice(ctx):
+    """Practice the current session"""
+    settings = bot.get_user_settings(ctx.author.id)
+    session = bot.get_current_session(str(ctx.author.id))
+    
+    if not session:
+        await ctx.send("Please start learning first with !start")
+        return
+
+    # Send instructions with an embed
+    embed = discord.Embed(
+        title=f"Practice Session: {session['name']}",
+        description="Let's practice pronunciation! I'll play each word, then you can repeat it.",
+        color=discord.Color.blue()
+    )
+    await ctx.send(embed=embed)
+    
+    # Practice each word
+    for word in session['words']:
+        # Generate and send TTS
+        await ctx.send(f"📢 Listen to: **{word}**")
+        audio_file = await bot.generate_tts(word)
+        
+        if audio_file:
+            await ctx.send(file=discord.File(audio_file))
+            os.remove(audio_file)
+            
+            # Wait for user's pronunciation
+            await ctx.send("🎤 Now you try! Send a voice message with your attempt.")
+            
+            try:
+                def check(message):
+                    return (message.author == ctx.author and 
+                           len(message.attachments) > 0 and 
+                           message.attachments[0].filename.endswith(('.mp3', '.wav', '.ogg')))
+                
+                msg = await bot.wait_for('message', timeout=30.0, check=check)
+                
+                # Process the pronunciation
+                status_msg = await ctx.send("Analyzing your pronunciation... 🎧")
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+                await msg.attachments[0].save(temp_file.name)
+                
+                # Check pronunciation
+                result = await bot.check_pronunciation(
+                    temp_file.name,
+                    word,
+                    settings.language
+                )
+                
+                if result:
+                    # Create feedback embed
+                    feedback = discord.Embed(
+                        title="Pronunciation Feedback",
+                        color=get_score_color(result['similarity'])
+                    )
+                    
+                    feedback.add_field(
+                        name="Your Pronunciation",
+                        value=f"```{result['transcribed']}```",
+                        inline=False
+                    )
+                    
+                    feedback.add_field(
+                        name="Accuracy Score",
+                        value=f"{result['similarity']:.1f}%",
+                        inline=True
+                    )
+                    
+                    await status_msg.delete()
+                    await ctx.send(embed=feedback)
+                
+                os.unlink(temp_file.name)
+                
+            except asyncio.TimeoutError:
+                await ctx.send("⏰ Time's up! Let's move to the next word.")
+                continue
+
+@bot.command()
+async def start(ctx):
+    """Start the language learning process"""
+    available_languages = ", ".join(SUPPORTED_LANGUAGES.values())
+    embed = discord.Embed(
+        title="Welcome to Language Learning!",
+        description=f"Available languages: {available_languages}\n\nUse `!setlang <code>` to choose your language.",
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=embed)
+
+@bot.command()
 async def setlang(ctx, language_code: str):
-    """Set the language for pronunciation practice"""
+    """Set the language to enroll in course"""
     language_code = language_code.lower()
     if language_code not in SUPPORTED_LANGUAGES:
         supported_codes = ", ".join(f"`{code}`" for code in SUPPORTED_LANGUAGES.keys())
         await ctx.send(f"Unsupported language code. Please use one of: {supported_codes}")
         return
         
-    settings = bot.get_user_settings(ctx.author.id)
-    settings.language = language_code
-    await ctx.send(f"Language set to {SUPPORTED_LANGUAGES[language_code]} (`{language_code}`)")
+    try:
+        # Enroll user in course
+        enrollment = bot.course_manager.enroll_user(str(ctx.author.id), language_code)
+        
+        # Create welcome embed
+        embed = discord.Embed(
+            title=f"Welcome to {SUPPORTED_LANGUAGES[language_code]}!",
+            description="You've been enrolled in the course. Here's what you can do:",
+            color=discord.Color.green()
+        )
+        
+        embed.add_field(
+            name="Start Learning",
+            value="Use `!practice` to begin your first lesson",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Check Progress",
+            value="Use `!progress` to see your course progress",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Need Help?",
+            value="Use `!help` to see all available commands",
+            inline=False
+        )
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        await ctx.send(f"Error enrolling in course: {str(e)}")
+
 
 async def translate_phrase(phrase: str, target_lang: str, source_lang: str, client: OpenAI) -> tuple[str, str]:
     """
@@ -213,6 +528,12 @@ Ensure the translation sounds natural in the target language."""
     except Exception as e:
         print(f"Translation error: {str(e)}")
         return phrase, phrase  # Return original phrase if translation fails
+
+@bot.command()
+async def progress(ctx):
+    """Show user's course progress"""
+    embed = await bot.get_course_progress(str(ctx.author.id))
+    await ctx.send(embed=embed)
 
 @bot.command()
 async def setphrase(ctx, *, phrase: str):
